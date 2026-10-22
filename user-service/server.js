@@ -1,75 +1,147 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+const { pool, initDB } = require('./db');
 
 const app = express();
 app.use(bodyParser.json());
 
-// In-memory database
-let users = [
-    { id: 1, name: 'John Doe', email: 'john@example.com' },
-    { id: 2, name: 'Jane Smith', email: 'jane@example.com' }
-];
-let nextId = 3; // tránh trùng id sau khi xoá user
+// Initialize database
+initDB();
+
+// id phải là số nguyên, tránh lỗi SQL khi gọi /users/abc
+const parseId = (req, res) => {
+    const id = parseInt(req.params.id);
+    if (Number.isNaN(id)) {
+        res.status(404).json({ error: 'User not found' });
+        return null;
+    }
+    return id;
+};
 
 // Get all users
-app.get('/users', (req, res) => {
-    res.json(users);
+app.get('/users', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM users ORDER BY id');
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Database error:', error);
+        res.status(500).json({ error: 'Database error' });
+    }
 });
 
 // Get user by ID
-app.get('/users/:id', (req, res) => {
-    const user = users.find(u => u.id === parseInt(req.params.id));
-    if (!user) {
-        return res.status(404).json({ error: 'User not found' });
+app.get('/users/:id', async (req, res) => {
+    const id = parseId(req, res);
+    if (id === null) return;
+    try {
+        const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Database error:', error);
+        res.status(500).json({ error: 'Database error' });
     }
-    res.json(user);
 });
 
 // Create new user
-app.post('/users', (req, res) => {
-    const { name, email } = req.body;
-    if (!name || !email) {
-        return res.status(400).json({ error: 'name and email are required' });
+app.post('/users', async (req, res) => {
+    try {
+        const { name, email } = req.body;
+        if (!name || !email) {
+            return res.status(400).json({ error: 'name and email are required' });
+        }
+        const result = await pool.query(
+            'INSERT INTO users (name, email) VALUES ($1, $2) RETURNING *',
+            [name, email]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        if (error.code === '23505') { // Unique violation
+            res.status(400).json({ error: 'Email already exists' });
+        } else {
+            console.error('Database error:', error);
+            res.status(500).json({ error: 'Database error' });
+        }
     }
-    const newUser = { id: nextId++, name, email };
-    users.push(newUser);
-    res.status(201).json(newUser);
 });
 
 // Update user
-app.put('/users/:id', (req, res) => {
-    const userId = parseInt(req.params.id);
-    const userIndex = users.findIndex(u => u.id === userId);
+app.put('/users/:id', async (req, res) => {
+    const id = parseId(req, res);
+    if (id === null) return;
+    try {
+        const { name, email } = req.body;
 
-    if (userIndex === -1) {
-        return res.status(404).json({ error: 'User not found' });
+        // COALESCE: field nào không gửi thì giữ giá trị cũ
+        const result = await pool.query(
+            `UPDATE users SET name = COALESCE($1, name), email = COALESCE($2, email),
+             updated_at = CURRENT_TIMESTAMP WHERE id = $3 RETURNING *`,
+            [name, email, id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.json(result.rows[0]);
+    } catch (error) {
+        if (error.code === '23505') {
+            return res.status(400).json({ error: 'Email already exists' });
+        }
+        console.error('Database error:', error);
+        res.status(500).json({ error: 'Database error' });
     }
-
-    users[userIndex] = { ...users[userIndex], ...req.body, id: userId };
-    res.json(users[userIndex]);
 });
 
 // Delete user
-app.delete('/users/:id', (req, res) => {
-    const userId = parseInt(req.params.id);
-    users = users.filter(u => u.id !== userId);
-    res.status(204).send();
+app.delete('/users/:id', async (req, res) => {
+    const id = parseId(req, res);
+    if (id === null) return;
+    try {
+        const result = await pool.query('DELETE FROM users WHERE id = $1', [id]);
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.status(204).send();
+    } catch (error) {
+        console.error('Database error:', error);
+        res.status(500).json({ error: 'Database error' });
+    }
 });
 
 // Health check
-app.get('/health', (req, res) => {
-    res.json({
-        service: 'user-service',
-        status: 'healthy',
-        timestamp: new Date().toISOString()
-    });
+app.get('/health', async (req, res) => {
+    try {
+        await pool.query('SELECT 1');
+        res.json({
+            service: 'user-service',
+            status: 'healthy',
+            database: 'connected',
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({
+            service: 'user-service',
+            status: 'unhealthy',
+            database: 'disconnected',
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
 });
 
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({
         service: 'User Service',
-        version: '1.0.0',
+        version: '2.0.0',
+        database: 'PostgreSQL',
         endpoints: [
             'GET /users - Get all users',
             'GET /users/:id - Get user by ID',
@@ -81,7 +153,6 @@ app.get('/', (req, res) => {
     });
 });
 
-// IMPORTANT: Use process.env.PORT for Heroku
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
     console.log(`User Service running on port ${PORT}`);
